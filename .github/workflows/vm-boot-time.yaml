@@ -5,13 +5,13 @@ on:
   workflow_dispatch:
     inputs:
       cpus:
-        description: vCPUs for the guest (GitHub runners only have 4)
-        required: false
-        default: "2"
-      memory:
-        description: Guest RAM in GiB
+        description: vCPU for the guest (overrides template; runner has 4)
         required: false
         default: "4"
+      memory:
+        description: Guest RAM in GiB (overrides template)
+        required: false
+        default: "8"
       warm_start:
         description: Also measure a stop/start cycle
         required: false
@@ -69,14 +69,15 @@ jobs:
 
       - name: Install Lima
         run: |
-          set -euo pipefail
-          base="https://github.com/lima-vm/lima/releases/download/v${LIMA_VERSION}"
-          asset="lima-${LIMA_VERSION}-Linux-x86_64.tar.gz"
-          curl -fsSL --retry 3 -o lima.tar.gz "$base/$asset"
-          curl -fsSL --retry 3 -o SHA256SUMS "$base/SHA256SUMS"
-          grep " ${asset}\$" SHA256SUMS | sha256sum -c -
-          sudo tar -C /usr/local -xzf lima.tar.gz
-          limactl --version
+            set -euo pipefail
+
+            VERSION=$(curl -fsSL https://api.github.com/repos/lima-vm/lima/releases/latest | jq -r .tag_name)
+            curl -fsSL "https://github.com/lima-vm/lima/releases/download/${VERSION}/lima-${VERSION:1}-$(uname -s)-$(uname -m).tar.gz" | tar Cxzvm /usr/local
+
+            # For Lima v1.1 onward
+            curl -fsSL "https://github.com/lima-vm/lima/releases/download/${VERSION}/lima-additional-guestagents-${VERSION:1}-$(uname -s)-$(uname -m).tar.gz" | tar Cxzvm /usr/local
+
+            limactl --version
 
       - name: Validate template
         run: limactl validate "$TEMPLATE"
@@ -118,8 +119,12 @@ jobs:
           limactl start --tty=false --timeout=20m "$INSTANCE" 2>&1 | tee "$log"
           rc=${PIPESTATUS[0]}
           t1=$(date +%s)
-          ready_s=$(grep -oE 'INFO\[[0-9]+\]' "$log" | tail -1 | grep -oE '[0-9]+' || echo '')
-          dl_s=$(grep -m1 -E 'Downloaded the image|Using cache' "$log" | grep -oE 'INFO\[[0-9]+\]' | grep -oE '[0-9]+' || echo '')
+          norm() { local v; v=$(printf '%s' "$1" | tr -cd '0-9' | sed -e 's/^0*//'); printf '%s' "${v:-0}"; }
+          raw_ready=$(grep -oE 'INFO\[[0-9]+\]' "$log" | tail -1 | grep -oE '[0-9]+' || echo '')
+          raw_dl=$(grep -m1 -E 'Downloaded the image|Using cache' "$log" | grep -oE 'INFO\[[0-9]+\]' | grep -oE '[0-9]+' || echo '')
+          ready_s=""; dl_s=""
+          [ -n "$raw_ready" ] && ready_s=$(norm "$raw_ready")
+          [ -n "$raw_dl" ] && dl_s=$(norm "$raw_dl")
           {
             echo "seconds=$((t1 - t0))"
             echo "ready=$ready_s"
@@ -179,7 +184,7 @@ jobs:
           warm_s="${{ steps.warm.outputs.seconds }}"
           ready_s="${{ steps.start.outputs.ready }}"
           dl_s="${{ steps.start.outputs.download }}"
-          total=$(( create_s + start_s ))
+          total=$(( ${create_s:-0} + ${start_s:-0} ))
           boot_s="-"
           if [ -n "$ready_s" ]; then
             boot_s=$(( ready_s - ${dl_s:-0} ))
@@ -189,10 +194,10 @@ jobs:
             echo
             echo "| phase | seconds |"
             echo "| --- | --- |"
-            echo "| create (resolve base template, generate cloud-init) | ${create_s}s |"
-            echo "| start (download image + boot to READY) | ${start_s}s |"
+            echo "| create (resolve base template, generate cloud-init) | ${create_s:-?}s |"
+            echo "| start (download image + boot to READY) | ${start_s:-?}s |"
             echo "| **cold total (create + start)** | **${total}s** |"
-            if [ -n "$dl_s" ]; then
+            if [ -n "$dl_s" ] && [ -n "$ready_s" ]; then
               echo "| _of which: image download_ | _${dl_s}s_ |"
               echo "| _of which: disk create + boot_ | _${boot_s}s_ |"
             fi
