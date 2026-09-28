@@ -1,0 +1,214 @@
+name: lima vm boot time
+
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      cpus:
+        description: vCPUs for the guest (GitHub runners only have 4)
+        required: false
+        default: "2"
+      memory:
+        description: Guest RAM in GiB
+        required: false
+        default: "4"
+      warm_start:
+        description: Also measure a stop/start cycle
+        required: false
+        default: "true"
+      cache_image:
+        description: Restore the Lima image cache (skips the image download)
+        required: false
+        default: "false"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lima-boot-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  LIMA_VERSION: "2.2.0"
+  INSTANCE: lima-boottest
+  TEMPLATE: template.yaml
+
+jobs:
+  boot:
+    name: Boot Fedora VM
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Preflight
+        run: |
+          set -euo pipefail
+          {
+            echo "host_kernel: $(uname -r)"
+            echo "host_cpus: $(nproc)"
+            echo "host_mem_gib: $(free -g | awk '/^Mem:/{print $2}')"
+            echo "host_disk_gib: $(df -BG --output=size / | tail -1 | tr -dc '0-9')"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          if [ ! -e /dev/kvm ]; then
+            echo "::error::No /dev/kvm on this runner. Nested virtualization is required for Lima's QEMU driver; it is available on ubuntu-* hosted runners but is not guaranteed."
+            exit 1
+          fi
+          echo "/dev/kvm present: $(ls -l /dev/kvm)"
+
+      - name: Install QEMU
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils ovmf
+          sudo modprobe kvm
+          sudo chown "$(id -un):$(id -gn)" /dev/kvm
+          qemu-system-x86_64 --version | head -1
+          qemu-system-x86_64 -accel help || true
+
+      - name: Install Lima
+        run: |
+          set -euo pipefail
+          base="https://github.com/lima-vm/lima/releases/download/v${LIMA_VERSION}"
+          asset="lima-${LIMA_VERSION}-Linux-x86_64.tar.gz"
+          curl -fsSL --retry 3 -o lima.tar.gz "$base/$asset"
+          curl -fsSL --retry 3 -o SHA256SUMS "$base/SHA256SUMS"
+          grep " ${asset}\$" SHA256SUMS | sha256sum -c -
+          sudo tar -C /usr/local -xzf lima.tar.gz
+          limactl --version
+
+      - name: Validate template
+        run: limactl validate "$TEMPLATE"
+
+      - name: Restore image cache
+        if: inputs.cache_image == 'true'
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/lima
+          key: lima-${{ runner.os }}-${{ hashFiles('template.yaml') }}-${{ env.LIMA_VERSION }}
+
+      - name: Prepare instance (resolve base template)
+        id: create
+        run: |
+          set -uo pipefail
+          log="$RUNNER_TEMP/lima-create.log"
+          t0=$(date +%s)
+          limactl create --name="$INSTANCE" \
+            --tty=false \
+            --vm-type=qemu \
+            --cpus="${{ inputs.cpus || '2' }}" \
+            --memory="${{ inputs.memory || '4' }}" \
+            "$TEMPLATE" 2>&1 | tee "$log"
+          rc=${PIPESTATUS[0]}
+          t1=$(date +%s)
+          echo "seconds=$((t1 - t0))" >> "$GITHUB_OUTPUT"
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::limactl create failed"
+            exit 1
+          fi
+
+      - name: Start instance (download image + boot to READY)
+        id: start
+        run: |
+          set -uo pipefail
+          log="$RUNNER_TEMP/lima-start.log"
+          t0=$(date +%s)
+          limactl start --tty=false --timeout=20m "$INSTANCE" 2>&1 | tee "$log"
+          rc=${PIPESTATUS[0]}
+          t1=$(date +%s)
+          ready_s=$(grep -oE 'INFO\[[0-9]+\]' "$log" | tail -1 | grep -oE '[0-9]+' || echo '')
+          dl_s=$(grep -m1 -E 'Downloaded the image|Using cache' "$log" | grep -oE 'INFO\[[0-9]+\]' | grep -oE '[0-9]+' || echo '')
+          {
+            echo "seconds=$((t1 - t0))"
+            echo "ready=$ready_s"
+            echo "download=$dl_s"
+            echo "rc=$rc"
+          } >> "$GITHUB_OUTPUT"
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::limactl start failed"
+            exit 1
+          fi
+
+      - name: Verify guest
+        run: |
+          set -euo pipefail
+          limactl shell "$INSTANCE" sed -n '1,3p' /etc/os-release
+          echo "nproc: $(limactl shell "$INSTANCE" nproc)"
+          echo "mem: $(limactl shell "$INSTANCE" free -g | awk '/^Mem:/{print $2" GiB"}')"
+          echo "kernel: $(limactl shell "$INSTANCE" uname -r)"
+
+      - name: Measure warm start
+        if: inputs.warm_start != 'false'
+        id: warm
+        run: |
+          set -uo pipefail
+          limactl stop "$INSTANCE" || true
+          log="$RUNNER_TEMP/lima-warm-start.log"
+          t0=$(date +%s)
+          limactl start --tty=false --timeout=20m "$INSTANCE" 2>&1 | tee "$log"
+          rc=${PIPESTATUS[0]}
+          t1=$(date +%s)
+          {
+            echo "seconds=$((t1 - t0))"
+            echo "rc=$rc"
+          } >> "$GITHUB_OUTPUT"
+          if [ "$rc" -ne 0 ]; then
+            echo "::warning::warm start failed"
+          fi
+
+      - name: Collect effective config
+        if: always()
+        run: |
+          set -uo pipefail
+          {
+            echo "### Effective instance config"
+            echo '```yaml'
+            cat "$HOME/.lima/$INSTANCE/lima.yaml"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          limactl list || true
+
+      - name: Summary
+        if: always()
+        run: |
+          set -uo pipefail
+          create_s="${{ steps.create.outputs.seconds }}"
+          start_s="${{ steps.start.outputs.seconds }}"
+          warm_s="${{ steps.warm.outputs.seconds }}"
+          ready_s="${{ steps.start.outputs.ready }}"
+          dl_s="${{ steps.start.outputs.download }}"
+          total=$(( create_s + start_s ))
+          boot_s="-"
+          if [ -n "$ready_s" ]; then
+            boot_s=$(( ready_s - ${dl_s:-0} ))
+          fi
+          {
+            echo "### Timings"
+            echo
+            echo "| phase | seconds |"
+            echo "| --- | --- |"
+            echo "| create (resolve base template, generate cloud-init) | ${create_s}s |"
+            echo "| start (download image + boot to READY) | ${start_s}s |"
+            echo "| **cold total (create + start)** | **${total}s** |"
+            if [ -n "$dl_s" ]; then
+              echo "| _of which: image download_ | _${dl_s}s_ |"
+              echo "| _of which: disk create + boot_ | _${boot_s}s_ |"
+            fi
+            if [ -n "$warm_s" ]; then
+              echo "| warm start (stop -> start, no download) | ${warm_s}s |"
+            fi
+            echo
+            echo "Guest: ${{ inputs.cpus || '2' }} vCPU / ${{ inputs.memory || '4' }} GiB, template \`${TEMPLATE}\`, lima v${LIMA_VERSION}."
+            echo
+            echo "Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: lima-logs-${{ github.run_id }}
+          path: ${{ runner.temp }}/lima-*.log
+          if-no-files-found: ignore
